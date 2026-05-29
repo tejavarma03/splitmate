@@ -11,6 +11,13 @@ from collections import defaultdict
 import hashlib
 import os
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -133,6 +140,13 @@ st.markdown("""
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "splitmate_data.json")
 
+SHEET_HEADERS = {
+    "groups": ["group_name", "member_name", "color"],
+    "expenses": ["id", "description", "amount", "category", "date", "paid_by", "group", "split_type", "participants", "split_details", "created_at"],
+    "settlements": ["id", "from", "to", "amount", "date", "group", "created_at"],
+    "activity_log": ["message", "time"],
+}
+
 CATEGORIES = {
     "🍔 Food & Drink": "#FF6B6B", "🏠 Housing": "#4ECDC4",
     "🚗 Transport": "#45B7D1", "🎬 Entertainment": "#96CEB4",
@@ -161,21 +175,18 @@ def normalize_data(data):
         if k not in data or data[k] is None:
             data[k] = v
 
-    # Remove old/legacy top-level members list if it exists.
     data.pop("members", None)
-
-    # Ensure required lists exist.
     data["groups"] = data.get("groups", []) or default_data()["groups"]
     data["expenses"] = data.get("expenses", []) or []
     data["settlements"] = data.get("settlements", []) or []
     data["activity_log"] = data.get("activity_log", []) or []
 
-    # Add IDs to old expenses/settlements so delete buttons work correctly.
     next_exp_id = 1
     for exp in data["expenses"]:
         if "id" not in exp:
             exp["id"] = next_exp_id
         try:
+            exp["amount"] = float(exp.get("amount", 0))
             next_exp_id = max(next_exp_id, int(exp.get("id", 0)) + 1)
         except Exception:
             next_exp_id += 1
@@ -185,6 +196,7 @@ def normalize_data(data):
         if "id" not in settlement:
             settlement["id"] = next_settle_id
         try:
+            settlement["amount"] = float(settlement.get("amount", 0))
             next_settle_id = max(next_settle_id, int(settlement.get("id", 0)) + 1)
         except Exception:
             next_settle_id += 1
@@ -192,30 +204,235 @@ def normalize_data(data):
     return data
 
 
-def load_data():
-    """Load data from splitmate_data.json. If the file is missing/empty/corrupt, start clean."""
+def google_sheets_ready():
+    """True when Streamlit Secrets contain the Google service account and sheet URL."""
+    try:
+        return (
+            gspread is not None
+            and Credentials is not None
+            and "spreadsheet_url" in st.secrets
+            and "gcp_service_account" in st.secrets
+        )
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_url(st.secrets["spreadsheet_url"])
+
+
+def get_or_create_worksheet(sheet, name, headers):
+    try:
+        ws = sheet.worksheet(name)
+    except Exception:
+        ws = sheet.add_worksheet(title=name, rows=1000, cols=max(len(headers), 3))
+
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [headers])
+    elif values[0] != headers:
+        ws.clear()
+        ws.update("A1", [headers])
+    return ws
+
+
+def load_from_google_sheets():
+    sheet = get_spreadsheet()
+    worksheets = {
+        name: get_or_create_worksheet(sheet, name, headers)
+        for name, headers in SHEET_HEADERS.items()
+    }
+
+    data = default_data()
+
+    group_rows = worksheets["groups"].get_all_records()
+    if group_rows:
+        groups = {}
+        for row in group_rows:
+            group_name = str(row.get("group_name", "")).strip()
+            member_name = str(row.get("member_name", "")).strip()
+            color = str(row.get("color", "#1DB954")).strip() or "#1DB954"
+            if not group_name or not member_name:
+                continue
+            if group_name not in groups:
+                groups[group_name] = {"name": group_name, "members": [], "color": color}
+            if member_name not in groups[group_name]["members"]:
+                groups[group_name]["members"].append(member_name)
+        data["groups"] = list(groups.values()) if groups else default_data()["groups"]
+
+    expenses = []
+    for row in worksheets["expenses"].get_all_records():
+        try:
+            participants = row.get("participants", "[]")
+            split_details = row.get("split_details", "{}")
+            if isinstance(participants, str):
+                participants = json.loads(participants) if participants else []
+            if isinstance(split_details, str):
+                split_details = json.loads(split_details) if split_details else {}
+            expenses.append({
+                "id": int(row.get("id", 0) or 0),
+                "description": str(row.get("description", "")),
+                "amount": float(row.get("amount", 0) or 0),
+                "category": str(row.get("category", "📦 Other")),
+                "date": str(row.get("date", "")),
+                "paid_by": str(row.get("paid_by", "")),
+                "group": str(row.get("group", "General")),
+                "split_type": str(row.get("split_type", "equal")),
+                "participants": participants,
+                "split_details": split_details,
+                "created_at": str(row.get("created_at", "")),
+            })
+        except Exception:
+            continue
+    data["expenses"] = expenses
+
+    settlements = []
+    for row in worksheets["settlements"].get_all_records():
+        try:
+            settlements.append({
+                "id": int(row.get("id", 0) or 0),
+                "from": str(row.get("from", "")),
+                "to": str(row.get("to", "")),
+                "amount": float(row.get("amount", 0) or 0),
+                "date": str(row.get("date", "")),
+                "group": str(row.get("group", "General")),
+                "created_at": str(row.get("created_at", "")),
+            })
+        except Exception:
+            continue
+    data["settlements"] = settlements
+
+    activities = []
+    for row in worksheets["activity_log"].get_all_records():
+        msg = str(row.get("message", "")).strip()
+        tm = str(row.get("time", "")).strip()
+        if msg and tm:
+            activities.append({"message": msg, "time": tm})
+    data["activity_log"] = activities
+
+    data = normalize_data(data)
+
+    # If the sheet is empty, seed it with the default General group.
+    if not group_rows:
+        save_to_google_sheets(data)
+
+    return data
+
+
+def save_to_google_sheets(data):
+    data = normalize_data(data)
+    sheet = get_spreadsheet()
+
+    # groups tab: one row per group/member combination
+    group_rows = []
+    for group in data["groups"]:
+        for member in group.get("members", []):
+            group_rows.append([
+                group.get("name", ""),
+                member,
+                group.get("color", "#1DB954"),
+            ])
+
+    # expenses tab
+    expense_rows = []
+    for exp in data["expenses"]:
+        expense_rows.append([
+            exp.get("id", ""),
+            exp.get("description", ""),
+            exp.get("amount", 0),
+            exp.get("category", ""),
+            exp.get("date", ""),
+            exp.get("paid_by", ""),
+            exp.get("group", ""),
+            exp.get("split_type", "equal"),
+            json.dumps(exp.get("participants", []), ensure_ascii=False),
+            json.dumps(exp.get("split_details", {}), ensure_ascii=False),
+            exp.get("created_at", ""),
+        ])
+
+    # settlements tab
+    settlement_rows = []
+    for s in data["settlements"]:
+        settlement_rows.append([
+            s.get("id", ""),
+            s.get("from", ""),
+            s.get("to", ""),
+            s.get("amount", 0),
+            s.get("date", ""),
+            s.get("group", ""),
+            s.get("created_at", ""),
+        ])
+
+    # activity tab
+    activity_rows = [
+        [a.get("message", ""), a.get("time", "")]
+        for a in data["activity_log"]
+    ]
+
+    rows_by_tab = {
+        "groups": group_rows,
+        "expenses": expense_rows,
+        "settlements": settlement_rows,
+        "activity_log": activity_rows,
+    }
+
+    for tab_name, headers in SHEET_HEADERS.items():
+        ws = get_or_create_worksheet(sheet, tab_name, headers)
+        ws.clear()
+        ws.update("A1", [headers])
+        rows = rows_by_tab.get(tab_name, [])
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+def load_from_local_json():
     if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return normalize_data(json.load(f))
         except Exception:
-            backup_file = DATA_FILE.replace(".json", f"_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-            try:
-                os.replace(DATA_FILE, backup_file)
-            except Exception:
-                pass
             return default_data()
-
     data = default_data()
-    save_data(data)
+    save_to_local_json(data)
     return data
 
 
-def save_data(data):
-    """Save immediately to splitmate_data.json so data remains after refresh/restart."""
+def save_to_local_json(data):
     data = normalize_data(data)
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def load_data():
+    if google_sheets_ready():
+        try:
+            return load_from_google_sheets()
+        except Exception as e:
+            st.error(f"Google Sheets connection failed: {e}")
+            st.warning("The app is temporarily using local JSON storage until the Google Sheets issue is fixed.")
+            return load_from_local_json()
+    else:
+        st.info("Google Sheets storage is not configured. The app is using local JSON storage.")
+        return load_from_local_json()
+
+
+def save_data(data):
+    if google_sheets_ready():
+        try:
+            save_to_google_sheets(data)
+            return
+        except Exception as e:
+            st.error(f"Google Sheets save failed: {e}")
+            st.warning("Saving to local JSON instead.")
+    save_to_local_json(data)
 
 
 def next_id(records):
